@@ -1,5 +1,5 @@
 from __future__ import absolute_import, print_function, division
-from pony.py23compat import PY37, PYPY, PY38, PY39, PY310
+from pony.py23compat import PY37, PYPY, PY38, PY39, PY310, PY311
 
 import sys, types, inspect
 from opcode import opname as opnames, HAVE_ARGUMENT, EXTENDED_ARG, cmp_op
@@ -165,7 +165,6 @@ class Decompiler(object):
             throw(DecompileError, 'Compiled code should represent a single expression')
     def get_instructions(decompiler):
         PY36 = sys.version_info >= (3, 6)
-        PY311 = sys.version_info >= (3, 11)
         before_yield = True
         code = decompiler.code
         co_code = code.co_code
@@ -449,7 +448,7 @@ class Decompiler(object):
         decompiler.kw_names = None
 
         args = values
-        keywords = None
+        keywords = []
         if keys:
             args = values[:-len(keys)]
             keywords = [ast.keyword(k, v) for k, v in zip(keys, values[-len(keys):])]
@@ -460,7 +459,8 @@ class Decompiler(object):
             callable_ = self
         else:
             args.insert(0, self)
-        return ast.Call(callable_, args, keywords)
+        decompiler.stack.append(callable_)
+        return decompiler._call_function(args, keywords)
 
     def CALL_FUNCTION_VAR(decompiler, argc):
         return decompiler.CALL_FUNCTION(argc, decompiler.stack.pop())
@@ -614,6 +614,37 @@ class Decompiler(object):
         decompiler.targets.setdefault(endpos, clause)
         return clause
 
+    def conditional_jump_none_impl(decompiler, endpos, negate):
+        expr = decompiler.stack.pop()
+        op = ast.Is
+        if decompiler.pos >= decompiler.conditions_end:
+            clausetype = ast.And if negate else ast.Or
+        elif decompiler.pos in decompiler.or_jumps:
+            clausetype = ast.Or
+            if negate:
+                op = ast.IsNot
+        else:
+            clausetype = ast.And
+            if negate:
+                op = ast.IsNot
+        expr = ast.Compare(expr, [op()], [ast.Constant(None)])
+        decompiler.stack.append(expr)
+
+        if decompiler.next_pos in decompiler.targets:
+            decompiler.process_target(decompiler.next_pos)
+
+        expr = decompiler.stack.pop()
+        clause = ast.BoolOp(op=clausetype(), values=[expr])
+        clause.endpos = endpos
+        decompiler.targets.setdefault(endpos, clause)
+        return clause
+
+    def jump_if_none(decompiler, endpos):
+        return decompiler.conditional_jump_none_impl(endpos, True)
+
+    def jump_if_not_none(decompiler, endpos):
+        return decompiler.conditional_jump_none_impl(endpos, False)
+
     def process_target(decompiler, pos, partial=False):
         if pos is None:
             limit = None
@@ -630,6 +661,10 @@ class Decompiler(object):
                 break
             if not decompiler.stack:
                 break
+            if decompiler.stack[-1] is None:
+                decompiler.stack.pop()
+                if not decompiler.stack:
+                    break
             top2 = decompiler.stack[-1]
             if isinstance(top2, ast.comprehension):
                 break
@@ -718,13 +753,19 @@ class Decompiler(object):
         return ast.Name(varname, ast.Load())
 
     def LOAD_METHOD(decompiler, methname):
-        return decompiler.LOAD_ATTR(methname)
+        result = decompiler.LOAD_ATTR(methname)
+        if PY311:
+            decompiler.stack.append(None)
+        return result
 
     LOOKUP_METHOD = LOAD_METHOD  # For PyPy
 
     def LOAD_NAME(decompiler, varname):
         decompiler.names.add(varname)
         return ast.Name(varname, ast.Load())
+
+    def MAKE_CELL(decompiler, freevar):
+        pass
 
     def MAKE_CLOSURE(decompiler, argc):
         decompiler.stack[-3:-2] = []  # ignore freevars
@@ -733,7 +774,7 @@ class Decompiler(object):
     def MAKE_FUNCTION(decompiler, argc):
         defaults = []
         if sys.version_info >= (3, 6):
-            if sys.version_info < (3, 11):
+            if not PY311:
                 qualname = decompiler.stack.pop()
             tos = decompiler.stack.pop()
             if argc & 0x08:
@@ -776,6 +817,10 @@ class Decompiler(object):
     POP_JUMP_FORWARD_IF_TRUE = JUMP_IF_TRUE
     POP_JUMP_IF_FALSE = JUMP_IF_FALSE
     POP_JUMP_IF_TRUE = JUMP_IF_TRUE
+    POP_JUMP_BACKWARD_IF_NONE = jump_if_none
+    POP_JUMP_BACKWARD_IF_NOT_NONE = jump_if_not_none
+    POP_JUMP_FORWARD_IF_NONE = jump_if_none
+    POP_JUMP_FORWARD_IF_NOT_NONE = jump_if_not_none
 
     def POP_TOP(decompiler):
         pass
